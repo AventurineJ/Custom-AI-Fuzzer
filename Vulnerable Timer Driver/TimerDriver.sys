@@ -1,0 +1,54 @@
+#include <ntddk.h>
+
+// 전역 변수
+KTIMER g_Timer;
+KDPC g_Dpc;
+ULONG g_Counter = 0;
+PVOID g_AllocatedMemory = NULL;
+
+// DPC 루틴 - 타이머 만료 시 실행
+void TimerDpcRoutine(PKDPC Dpc, PVOID DeferredContext, PVOID SystemArgument1, PVOID SystemArgument2) {
+    g_Counter++;
+    
+    // 취약점: 반복적인 메모리 할당
+    if (g_AllocatedMemory) {
+        // 기존 메모리 해제 없이 새 할당 - 메모리 릭
+        g_AllocatedMemory = ExAllocatePoolWithTag(NonPagedPool, 1024, 'TIMR');
+    } else {
+        g_AllocatedMemory = ExAllocatePoolWithTag(NonPagedPool, 1024, 'TIMR');
+    }
+    
+    // 취약점: 널 포인터 역참조 가능성
+    if (g_Counter > 1000000) {
+        *(ULONG*)NULL = 0xDEADBEEF;  // 크래시 유발
+    }
+    
+    DbgPrint("Timer DPC executed, Counter: %lu\n", g_Counter);
+}
+
+void DriverUnload(PDRIVER_OBJECT DriverObject) {
+    // 취약점: 타이머 취소 없이 종료
+    // KeCancelTimer(&g_Timer);  // 주석 처리됨
+    
+    if (g_AllocatedMemory) {
+        ExFreePoolWithTag(g_AllocatedMemory, 'TIMR');
+    }
+    
+    DbgPrint("TimerDrv unloaded\n");
+}
+
+NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) {
+    LARGE_INTEGER dueTime;
+    
+    // 타이머 초기화
+    KeInitializeTimer(&g_Timer);
+    KeInitializeDpc(&g_Dpc, TimerDpcRoutine, NULL);
+    
+    // 타이머 설정 (1초마다 실행)
+    dueTime.QuadPart = -10000000LL;  // 1초 (100ns 단위)
+    KeSetTimerEx(&g_Timer, dueTime, 1000, &g_Dpc);  // 1초 간격
+    
+    DriverObject->DriverUnload = DriverUnload;
+    DbgPrint("TimerDrv loaded\n");
+    return STATUS_SUCCESS;
+}
