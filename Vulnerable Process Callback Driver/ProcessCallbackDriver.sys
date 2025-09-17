@@ -1,0 +1,61 @@
+#include <ntddk.h>
+
+// 전역 변수
+PVOID g_CallbackHandle = NULL;
+ULONG g_ProcessCount = 0;
+ULONG g_SuspiciousProcesses[100] = {0};  // 취약한 배열
+
+// 프로세스 생성/종료 콜백
+OB_PREOP_CALLBACK_STATUS ProcessPreCallback(PVOID RegistrationContext, POB_PRE_OPERATION_INFORMATION OperationInformation) {
+    PEPROCESS process = (PEPROCESS)OperationInformation->Object;
+    ULONG pid = (ULONG)PsGetProcessId(process);
+    
+    // 취약점: 배열 경계 검사 없음
+    if (g_ProcessCount < 100) {
+        g_SuspiciousProcesses[g_ProcessCount] = pid;  // 경쟁 조건 + 오버플로우 가능성
+        g_ProcessCount++;
+    }
+    
+    // 취약점: 메모리 릭 가능성
+    if (pid == 0x1337) {  // 특정 PID 감시
+        // 메모리 할당 후 해제하지 않음
+        PVOID leak_memory = ExAllocatePoolWithTag(NonPagedPool, 1024, 'LEAK');
+        // leak_memory가 해제되지 않음 - 메모리 릭
+    }
+    
+    return OB_PREOP_SUCCESS;
+}
+
+void DriverUnload(PDRIVER_OBJECT DriverObject) {
+    if (g_CallbackHandle) {
+        ObUnRegisterCallbacks(g_CallbackHandle);
+    }
+    DbgPrint("ProcessCallbackDrv unloaded\n");
+}
+
+NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) {
+    OB_CALLBACK_REGISTRATION callbackRegistration = {0};
+    OB_OPERATION_REGISTRATION operationRegistration = {0};
+    
+    // 콜백 등록 구조체 설정
+    operationRegistration.ObjectType = PsProcessType;
+    operationRegistration.Operations = OB_OPERATION_HANDLE_CREATE | OB_OPERATION_HANDLE_DUPLICATE;
+    operationRegistration.PreOperation = ProcessPreCallback;
+    
+    callbackRegistration.Version = OB_FLT_REGISTRATION_VERSION;
+    callbackRegistration.OperationRegistrationCount = 1;
+    callbackRegistration.RegistrationContext = NULL;
+    callbackRegistration.OperationRegistration = &operationRegistration;
+    
+    // 취약점: 콜백 등록 실패 시 처리 없음
+    NTSTATUS status = ObRegisterCallbacks(&callbackRegistration, &g_CallbackHandle);
+    if (!NT_SUCCESS(status)) {
+        DbgPrint("Failed to register callbacks: 0x%08X\n", status);
+        // 핸들 해제 없이 종료 - 리소스 릭
+        return status;
+    }
+    
+    DriverObject->DriverUnload = DriverUnload;
+    DbgPrint("ProcessCallbackDrv loaded\n");
+    return STATUS_SUCCESS;
+}
