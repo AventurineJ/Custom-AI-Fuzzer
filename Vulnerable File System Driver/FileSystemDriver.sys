@@ -1,0 +1,89 @@
+#include <ntddk.h>
+
+// 전역 변수
+PDEVICE_OBJECT g_DeviceObject = NULL;
+ULONG g_Buffer[1000] = {0};  // 취약한 공유 버퍼
+FAST_MUTEX g_BufferMutex;
+
+void DriverUnload(PDRIVER_OBJECT DriverObject) {
+    UNICODE_STRING symbolicLink = RTL_CONSTANT_STRING(L"\\DosDevices\\FileSystemDrv");
+    IoDeleteSymbolicLink(&symbolicLink);
+    if (g_DeviceObject) {
+        IoDeleteDevice(g_DeviceObject);
+    }
+    DbgPrint("FileSystemDrv unloaded\n");
+}
+
+// CREATE 처리 - 버퍼 초기화 취약점
+NTSTATUS DispatchCreate(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
+    // 취약점: 멀티스레드 환경에서 뮤텍스 없이 초기화
+    RtlZeroMemory(g_Buffer, sizeof(g_Buffer));  // 경쟁 조건 발생 가능
+    DbgPrint("Buffer initialized without synchronization\n");
+    
+    Irp->IoStatus.Status = STATUS_SUCCESS;
+    Irp->IoStatus.Information = 0;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    return STATUS_SUCCESS;
+}
+
+// READ 처리 - 정보 누출 취약점
+NTSTATUS DispatchRead(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
+    PIO_STACK_LOCATION irpStack = IoGetCurrentIrpStackLocation(Irp);
+    ULONG readLength = irpStack->Parameters.Read.Length;
+    PVOID userBuffer = Irp->UserBuffer;
+    
+    // 취약점: 초기화되지 않은 메모리 읽기
+    if (userBuffer && readLength > 0) {
+        // 일부 버퍼는 초기화되지 않은 상태로 남아있음
+        memcpy(userBuffer, g_Buffer, min(readLength, sizeof(g_Buffer)));
+    }
+    
+    Irp->IoStatus.Status = STATUS_SUCCESS;
+    Irp->IoStatus.Information = min(readLength, sizeof(g_Buffer));
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    return STATUS_SUCCESS;
+}
+
+// WRITE 처리 - 버퍼 오버플로우
+NTSTATUS DispatchWrite(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
+    PIO_STACK_LOCATION irpStack = IoGetCurrentIrpStackLocation(Irp);
+    ULONG writeLength = irpStack->Parameters.Write.Length;
+    PVOID userBuffer = Irp->UserBuffer;
+    
+    // 취약점: 입력 길이 검증 없음
+    if (userBuffer && writeLength > 0) {
+        char small_buffer[256];
+        memcpy(small_buffer, userBuffer, writeLength);  // 버퍼 오버플로우
+    }
+    
+    Irp->IoStatus.Status = STATUS_SUCCESS;
+    Irp->IoStatus.Information = writeLength;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) {
+    UNICODE_STRING deviceName = RTL_CONSTANT_STRING(L"\\Device\\FileSystemDrv");
+    UNICODE_STRING symbolicLink = RTL_CONSTANT_STRING(L"\\DosDevices\\FileSystemDrv");
+    
+    NTSTATUS status = IoCreateDevice(DriverObject, 0, &deviceName, FILE_DEVICE_UNKNOWN, 0, FALSE, &g_DeviceObject);
+    if (!NT_SUCCESS(status)) return status;
+    
+    status = IoCreateSymbolicLink(&symbolicLink, &deviceName);
+    if (!NT_SUCCESS(status)) {
+        IoDeleteDevice(g_DeviceObject);
+        return status;
+    }
+    
+    // MajorFunction 등록
+    DriverObject->MajorFunction[IRP_MJ_CREATE] = DispatchCreate;
+    DriverObject->MajorFunction[IRP_MJ_READ] = DispatchRead;
+    DriverObject->MajorFunction[IRP_MJ_WRITE] = DispatchWrite;
+    DriverObject->DriverUnload = DriverUnload;
+    
+    // 뮤텍스 초기화 (하지만 일부 함수에서는 사용하지 않음)
+    ExInitializeFastMutex(&g_BufferMutex);
+    
+    DbgPrint("FileSystemDrv loaded\n");
+    return STATUS_SUCCESS;
+}
