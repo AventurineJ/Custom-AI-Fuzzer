@@ -1,0 +1,75 @@
+#include <ntddk.h>
+#include <ndis.h>
+
+// 전역 변수
+PDEVICE_OBJECT g_DeviceObject = NULL;
+UCHAR g_NetworkBuffer[2048] = {0};  // 네트워크 패킷 버퍼
+ULONG g_BufferIndex = 0;
+
+void DriverUnload(PDRIVER_OBJECT DriverObject) {
+    if (g_DeviceObject) {
+        IoDeleteDevice(g_DeviceObject);
+    }
+    DbgPrint("NetworkDrv unloaded\n");
+}
+
+// 네트워크 패킷 수신 시뮬레이션
+NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
+    PIO_STACK_LOCATION irpStack = IoGetCurrentIrpStackLocation(Irp);
+    PVOID inputBuffer = Irp->AssociatedIrp.SystemBuffer;
+    ULONG inputLength = irpStack->Parameters.DeviceIoControl.InputBufferLength;
+    
+    switch (irpStack->Parameters.DeviceIoControl.IoControlCode) {
+        case 0x222000:  // 네트워크 패킷 수신 IOCTL
+            {
+                // 취약점 1: 입력 길이 검증 없음
+                if (inputBuffer && inputLength > 0) {
+                    // 취약점 2: 버퍼 인덱스 검증 없음
+                    if (g_BufferIndex + inputLength < sizeof(g_NetworkBuffer)) {
+                        memcpy(&g_NetworkBuffer[g_BufferIndex], inputBuffer, inputLength);
+                        g_BufferIndex += inputLength;
+                    } else {
+                        // 버퍼 오버플로우 가능성
+                        memcpy(g_NetworkBuffer, inputBuffer, min(inputLength, sizeof(g_NetworkBuffer)));
+                    }
+                }
+                
+                // 취약점 3: 포맷 스트링
+                if (inputLength >= 4 && *(PULONG)inputBuffer == 0x464D5443) {  // "CTMF"
+                    char* packet_data = (char*)inputBuffer + 4;
+                    DbgPrint(packet_data);  // 포맷 스트링 취약점
+                }
+            }
+            break;
+            
+        case 0x222004:  // 패킷 전송 IOCTL
+            {
+                // 취약점 4: 초기화되지 않은 메모리 사용
+                UCHAR send_buffer[1500];
+                // send_buffer가 초기화되지 않음 - 정보 누출 가능성
+                memcpy(send_buffer, g_NetworkBuffer, min(inputLength, sizeof(send_buffer)));
+                
+                // 실제 전송 로직 (생략)
+                DbgPrint("Packet sent: %lu bytes\n", inputLength);
+            }
+            break;
+    }
+    
+    Irp->IoStatus.Status = STATUS_SUCCESS;
+    Irp->IoStatus.Information = 0;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) {
+    UNICODE_STRING deviceName = RTL_CONSTANT_STRING(L"\\Device\\NetworkDrv");
+    
+    NTSTATUS status = IoCreateDevice(DriverObject, 0, &deviceName, FILE_DEVICE_NETWORK, 0, FALSE, &g_DeviceObject);
+    if (!NT_SUCCESS(status)) return status;
+    
+    DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = DispatchDeviceControl;
+    DriverObject->DriverUnload = DriverUnload;
+    
+    DbgPrint("NetworkDrv loaded\n");
+    return STATUS_SUCCESS;
+}
