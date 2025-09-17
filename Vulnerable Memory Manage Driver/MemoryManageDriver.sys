@@ -1,0 +1,126 @@
+#include <ntddk.h>
+
+#define MAX_ALLOCATIONS 1000
+
+typedef struct _MEMORY_BLOCK {
+    PVOID Address;
+    SIZE_T Size;
+    ULONG Tag;
+} MEMORY_BLOCK, *PMEMORY_BLOCK;
+
+// 전역 변수
+MEMORY_BLOCK g_Allocations[MAX_ALLOCATIONS] = {0};
+ULONG g_AllocationCount = 0;
+FAST_MUTEX g_AllocationMutex;
+
+void DriverUnload(PDRIVER_OBJECT DriverObject) {
+    // 취약점: 메모리 해제 누락
+    for (ULONG i = 0; i < g_AllocationCount; i++) {
+        if (g_Allocations[i].Address) {
+            // 일부 블록은 해제되지 않음 - 메모리 릭
+            if (i % 2 == 0) {  // 의도적 누락
+                ExFreePoolWithTag(g_Allocations[i].Address, g_Allocations[i].Tag);
+            }
+        }
+    }
+    
+    DbgPrint("MemoryManagerDrv unloaded\n");
+}
+
+NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
+    PIO_STACK_LOCATION irpStack = IoGetCurrentIrpStackLocation(Irp);
+    PVOID inputBuffer = Irp->AssociatedIrp.SystemBuffer;
+    ULONG inputLength = irpStack->Parameters.DeviceIoControl.InputBufferLength;
+    
+    switch (irpStack->Parameters.DeviceIoControl.IoControlCode) {
+        case 0x222008:  // 메모리 할당
+            {
+                if (inputLength >= sizeof(ULONG)) {
+                    SIZE_T size = *(PULONG)inputBuffer;
+                    
+                    // 취약점 1: 크기 검증 없음
+                    if (size > 0 && size < 0x1000000) {  // 16MB 제한
+                        PVOID address = ExAllocatePoolWithTag(NonPagedPool, size, 'MEMM');
+                        
+                        // 취약점 2: 배열 경계 검사 없음
+                        if (g_AllocationCount < MAX_ALLOCATIONS) {
+                            g_Allocations[g_AllocationCount].Address = address;
+                            g_Allocations[g_AllocationCount].Size = size;
+                            g_Allocations[g_AllocationCount].Tag = 'MEMM';
+                            g_AllocationCount++;
+                        }
+                        // 배열 오버플로우 가능성
+                        
+                        if (address) {
+                            RtlZeroMemory(address, size);
+                        }
+                    }
+                }
+            }
+            break;
+            
+        case 0x22200C:  // 메모리 해제
+            {
+                if (inputLength >= sizeof(ULONG)) {
+                    ULONG index = *(PULONG)inputBuffer;
+                    
+                    // 취약점 3: 인덱스 검증 없음
+                    if (index < g_AllocationCount) {
+                        if (g_Allocations[index].Address) {
+                            ExFreePoolWithTag(g_Allocations[index].Address, g_Allocations[index].Tag);
+                            g_Allocations[index].Address = NULL;
+                        }
+                    } else {
+                        // 잘못된 인덱스 접근 - 널 포인터 역참조 가능성
+                        *(PULONG)NULL = 0xDEADBEEF;
+                    }
+                }
+            }
+            break;
+            
+        case 0x222010:  // 더블 프리 방지 테스트
+            {
+                if (inputLength >= sizeof(ULONG)) {
+                    ULONG index = *(PULONG)inputBuffer;
+                    
+                    // 취약점 4: 더블 프리
+                    if (index < g_AllocationCount) {
+                        if (g_Allocations[index].Address) {
+                            ExFreePoolWithTag(g_Allocations[index].Address, g_Allocations[index].Tag);
+                            ExFreePoolWithTag(g_Allocations[index].Address, g_Allocations[index].Tag);  // 더블 프리
+                            g_Allocations[index].Address = NULL;
+                        }
+                    }
+                }
+            }
+            break;
+    }
+    
+    Irp->IoStatus.Status = STATUS_SUCCESS;
+    Irp->IoStatus.Information = 0;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) {
+    UNICODE_STRING deviceName = RTL_CONSTANT_STRING(L"\\Device\\MemoryManagerDrv");
+    UNICODE_STRING symbolicLink = RTL_CONSTANT_STRING(L"\\DosDevices\\MemoryManagerDrv");
+    PDEVICE_OBJECT deviceObject = NULL;
+    
+    NTSTATUS status = IoCreateDevice(DriverObject, 0, &deviceName, FILE_DEVICE_UNKNOWN, 0, FALSE, &deviceObject);
+    if (!NT_SUCCESS(status)) return status;
+    
+    status = IoCreateSymbolicLink(&symbolicLink, &deviceName);
+    if (!NT_SUCCESS(status)) {
+        IoDeleteDevice(deviceObject);
+        return status;
+    }
+    
+    ExInitializeFastMutex(&g_AllocationMutex);
+    
+    DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = DispatchDeviceControl;
+    DriverObject->DriverUnload = DriverUnload;
+    
+    DbgPrint("MemoryManagerDrv loaded\n");
+    return STATUS_SUCCESS;
+}
